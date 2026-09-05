@@ -11,7 +11,7 @@ No environment installation or modification was needed.
 
 ## Regression checks
 
-All eight tests passed (`python -m unittest -v test_sbm`), covering:
+All ten tests passed (`python -m unittest -v test_sbm`), covering:
 
 - Subsaturated initial conditions, shared radiation/humidity arrays, and CO2
   propagation to both radiation components, including quadrupling.
@@ -19,7 +19,7 @@ All eight tests passed (`python -m unittest -v test_sbm`), covering:
 - Daily means versus extrema and round-trip NetCDF output.
 - Catchable failure snapshots.
 - Synchronous and asynchronous radiation budget accounting.
-- DCM storage accounting with the separate legacy WTG source.
+- DCM storage accounting with separate conservative WTG convergence.
 - Original RCE and control/abrupt-4xCO2 entry points.
 
 Python compilation and `git diff --check` also passed.
@@ -88,6 +88,30 @@ produce an acceptable RCE. They do not justify silently changing albedo or SBM
 reference humidity. The full experiment entry point now refuses to use an RCE
 candidate that has not passed the equilibrium criteria.
 
-The known WTG transport defects remain outside fixes 1--4. They are isolated in
-`dcm_wtg.py` and separately accounted for in DCM output; the standalone results
-above do not validate that circulation.
+## WTG operator update
+
+The legacy temperature-difference relaxation has been replaced by the
+Shaevitz--Sobel (2004) mean-heating method with `C=1`. Free-tropospheric
+temperature is shared, the diabatic-heating anomaly diagnoses opposite omega,
+and omega tapers from 850 hPa to zero at the surface. Moisture transport now
+uses closed, upwind vertical fluxes and exactly cancelling horizontal fluxes
+derived from continuity. The humidity floor, moving cold-point stratospheric
+relaxation, and convergence-gated vertical advection were removed.
+
+Unit tests verify temperature projection, opposite omega, thermal-energy
+redistribution, uniform-tracer invariance, moisture conservation, positivity,
+and CFL subcycling. The standalone results above contain no WTG and therefore
+do not validate the coupled DCM climate or its equilibration.
+
+A 60-level, 20-day coupled smoke integration completed without invalid states.
+The largest daily absolute equal-area pair-mean WTG energy convergence was
+`6.95e-12 W/m2`; the corresponding water convergence was below
+`5.3e-20 kg/m2/s`. The maximum pair-mean storage-minus-TOA residual was
+`1.73e-4 W/m2`, and the maximum column process-budget residual was
+`2.26e-9 W/m2`.
+
+Independent 60-level five-day integrations at 600 s and 300 s produced maximum
+final-profile differences of `0.00181 K` in atmospheric temperature and
+`2.82e-7 kg/kg` in humidity. Final land and ocean surface-temperature
+differences were `+5.44e-4 K` and `-4.00e-5 K`, respectively. These are short
+numerical checks, not evidence that the long coupled climate has equilibrated.

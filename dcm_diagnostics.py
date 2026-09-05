@@ -95,7 +95,7 @@ def step_diagnostics(scm, before):
 
 
 def include_wtg_diagnostics(scm, record, before, omega):
-    """Account for legacy transport separately from column-physics closure."""
+    """Account for conservative WTG redistribution separately from physics."""
     dt = timestep_seconds(scm)
     mass = layer_mass(scm)
     dthermal = float(np.sum(mass * const.cp * (scm.Tatm - before["Tatm"])) / dt)
@@ -110,14 +110,17 @@ def include_wtg_diagnostics(scm, record, before, omega):
         else:
             record[name] = value
     record["omega"] = omega
+    record["thermal_WTG"] = dthermal
+    record["latent_WTG"] = const.Lhvap * dwater
     record["energy_WTG"] = transport
     record["water_WTG"] = dwater
     record["thermal_storage"] += dthermal
     record["latent_storage"] += const.Lhvap * dwater
     record["energy_storage"] += transport
     record["water_storage"] += dwater
-    # budget_residual and water_residual exclude the separately recorded WTG
-    # source. energy_residual is total storage minus TOA, including transport.
+    # budget_residual and water_residual include WTG as a recorded convergence.
+    # energy_residual is storage minus TOA and thus includes column transport;
+    # its equal-area pair mean removes conservative WTG redistribution.
     record["energy_residual"] += transport
     record["energy_residual_absmax"] = abs(record["energy_residual"])
 
@@ -190,8 +193,11 @@ def diagnose_control_equilibrium(ds, mean_days=365):
         trend = np.polyfit(sub.time, sub.Ts, 1)[0] * 365.
         print(f"{column}: Ts={float(sub.Ts.mean()):.3f} K, trend={trend:+.5f} K/yr, "
               f"TOA={float(sub.TOA_imbalance.mean()):+.4f} W/m2")
-    print(f"Domain TOA={float(eq.TOA_imbalance.mean()):+.4f} W/m2; "
-          "legacy WTG transport is not energy-conservative.")
+    pair_toa = float(eq.TOA_imbalance.mean())
+    pair_storage = float(eq.energy_storage.mean())
+    pair_wtg = float(eq.energy_WTG.mean())
+    print(f"Domain TOA={pair_toa:+.4f} W/m2, storage={pair_storage:+.4f} W/m2, "
+          f"pair-mean WTG convergence={pair_wtg:+.3e} W/m2.")
 
 
 def get_mean_control_state(ds_control, mean_days=365):

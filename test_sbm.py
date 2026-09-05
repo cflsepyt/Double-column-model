@@ -17,6 +17,10 @@ from dcm_rundiag_0817 import (
 )
 from dcm_io import save_dataset, mean_rce_dataset
 from dcm_diagnostics import equilibrium_summary
+from dcm_wtg import (
+    WTGConfig, advance_dcm_one_step, common_static_stability, pressure_interfaces,
+    transport_moisture_pair,
+)
 
 
 class SBMTests(unittest.TestCase):
@@ -109,6 +113,59 @@ class SBMTests(unittest.TestCase):
         np.testing.assert_allclose(ds.water_storage - ds.evaporation + ds.precipitation - ds.water_WTG,
                                    ds.water_residual, atol=1e-12)
         self.assertEqual(ds.water_WTG.attrs["units"], "kg m-2 s-1")
+        self.assertEqual(ds.attrs["wtg_heat_capacity_factor"], 1.0)
+        self.assertIn("Shaevitz-Sobel-2004", ds.attrs["wtg_method"])
+
+    def test_wtg_mean_heating_projection_and_mass_conservation(self):
+        land = create_column(30, 1., lh_resistance=0.6)
+        ocean = create_column(30, 20.)
+        p = land.lev * 100.
+        config = WTGConfig()
+        free = ((p >= config.top_pressure_pa) &
+                (p < config.pbl_top_pressure_pa))
+        before = (land.Tatm.copy(), ocean.Tatm.copy())
+        land.Tatm[free] += 0.03
+        ocean.Tatm[free] -= 0.01
+        expected = 0.5 * (land.Tatm.copy() + ocean.Tatm.copy())
+        mass = layer_mass(land)
+        thermal_before = float(np.sum(mass * const.cp * (land.Tatm + ocean.Tatm)))
+        omega_land, omega_ocean = advance_dcm_one_step(
+            land, ocean, p, 600., Tatm_before=before,
+            config=config, advance_physics=False,
+        )
+        np.testing.assert_allclose(land.Tatm[free], expected[free], atol=1e-13)
+        np.testing.assert_allclose(ocean.Tatm[free], expected[free], atol=1e-13)
+        np.testing.assert_allclose(omega_land, -omega_ocean, atol=0., rtol=0.)
+        stability = common_static_stability(expected, p)
+        np.testing.assert_allclose(
+            omega_land[free], (0.02 / 600.) / stability[free], rtol=1e-12,
+        )
+        self.assertGreater(float(np.max(np.abs(omega_land[free]))), 0.)
+        thermal_after = float(np.sum(mass * const.cp * (land.Tatm + ocean.Tatm)))
+        self.assertAlmostEqual(thermal_after, thermal_before, places=7)
+
+    def test_wtg_flux_form_moisture_is_positive_and_conservative(self):
+        p = np.array([12500., 37500., 62500., 87500.])
+        edges = pressure_interfaces(p)
+        omega = np.array([0., -0.12, 0.08, 0.04, 0.])
+        uniform = np.full(4, 0.01)
+        q_land, q_ocean, _ = transport_moisture_pair(
+            uniform, uniform, omega, p, 3600., cfl=0.45,
+        )
+        np.testing.assert_allclose(q_land, uniform, atol=1e-15)
+        np.testing.assert_allclose(q_ocean, uniform, atol=1e-15)
+
+        initial_land = np.array([1e-6, 3e-5, 2e-3, 1.5e-2])
+        initial_ocean = np.array([2e-6, 5e-5, 3e-3, 1.8e-2])
+        initial_water = np.sum(np.diff(edges) * (initial_land + initial_ocean))
+        q_land, q_ocean, nsubsteps = transport_moisture_pair(
+            initial_land, initial_ocean, omega, p, 86400., cfl=0.45,
+        )
+        final_water = np.sum(np.diff(edges) * (q_land + q_ocean))
+        self.assertGreater(nsubsteps, 1)
+        self.assertGreaterEqual(float(np.min(q_land)), 0.)
+        self.assertGreaterEqual(float(np.min(q_ocean)), 0.)
+        self.assertAlmostEqual(float(final_water), float(initial_water), places=10)
 
     def test_original_rce_and_experiment_entry_points(self):
         with tempfile.TemporaryDirectory() as tmp:

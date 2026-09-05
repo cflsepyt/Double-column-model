@@ -27,7 +27,7 @@ starts fresh; it does not resume an earlier validation run.
 | `dcm_physics.py` | SBM, radiation, surface fluxes, condensation, initialization, CO2 |
 | `dcm_diagnostics.py` | State checks, storage/flux budgets, extrema, equilibrium criteria |
 | `dcm_io.py` | Dataset construction, NetCDF/JSON writes, failure snapshots, plotting |
-| `dcm_wtg.py` | Existing WTG equations, isolated without scientific changes |
+| `dcm_wtg.py` | Shaevitz--Sobel mean-heating WTG and conservative moisture transport |
 | `dcm_rundiag_0817.py` | Integration and original control/abrupt-4xCO2 workflow |
 | `validate_sbm.py` | Standalone timestep-comparison command |
 
@@ -83,6 +83,8 @@ subprocess tendencies are read without a second physics evaluation.
 - `radiation_residual`: integrated radiative heating minus ASR - OLR.
 - `water_residual`: water storage minus evaporation plus total precipitation;
   in DCM output the separately recorded `water_WTG` input is also subtracted.
+- `thermal_WTG`, `latent_WTG`, and `energy_WTG`: transport convergence in each
+  column. Their equal-area pair means vanish to numerical precision.
 - `precipitation_convective` and `precipitation_large_scale`: separate rates;
   `precipitation` is their sum, all in kg/m2/s (multiply by 86400 for mm/day).
 - `SBM_Tatm_tendency`, `SBM_q_tendency`, `cape`, `cin`, and `RH`: daily means.
@@ -106,13 +108,25 @@ does not guarantee radiative accuracy outside RRTMG's tabulated regime merely
 because temperatures are finite. Failure files are diagnostic snapshots, not
 complete restart files.
 
-## Scope limitation: WTG remains pending
+## WTG coupling
 
-This implements SBM fixes 1--4. The known WTG moisture-transport sign error,
-nonconservative temperature relaxation, stratospheric moisture relaxation, and
-humidity floor remain in `dcm_wtg.py`. DCM output records the combined change from
-those legacy operations as `energy_WTG` and `water_WTG`; passing a standalone
-SBM validation does **not** establish scientific validity of the full DCM.
+The double-column operator follows Shaevitz and Sobel's mean-heating method with
+the artificial heat-capacity factor fixed at `C=1`. Between the configured
+100 hPa WTG top and the 850 hPa PBL top, the columns share one temperature:
+their mean diabatic heating changes that state, and the heating anomaly diagnoses
+equal-and-opposite omega. Omega tapers linearly from its 850 hPa value to zero
+at the surface.
+
+Moisture uses closed-boundary, donor-cell vertical fluxes and one exactly
+cancelling horizontal intercolumn flux derived from continuity. CFL subcycling
+preserves positivity without a humidity floor. The former moving cold-point
+relaxation and stratospheric moisture source have been removed. PBL temperature
+remains controlled by local column physics because this reduced model does not
+contain the mechanical-energy closure needed for an additional PBL pressure-work
+term.
+
+Passing the standalone SBM validation still does **not** by itself establish the
+scientific validity or equilibration of the coupled DCM.
 
 ## References
 
@@ -120,3 +134,4 @@ SBM validation does **not** establish scientific validity of the full DCM.
 - [SBM implementation](https://github.com/climlab/climlab-sbm-convection/blob/main/climlab_sbm_convection/climlab_betts_miller.f90)
 - [climlab condensation implementation](https://climlab.readthedocs.io/en/latest/_modules/climlab/dynamics/large_scale_condensation.html)
 - [climlab radiation configuration](https://climlab.readthedocs.io/en/latest/_modules/climlab/radiation/radiation.html)
+- [Shaevitz and Sobel (2004), full-vertical-structure WTG](https://doi.org/10.1175/1520-0493(2004)132%3C0662:ITWTGA%3E2.0.CO;2)

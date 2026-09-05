@@ -1,7 +1,6 @@
-"""Run SBM RCE and the legacy double-column experiments.
+"""Run SBM RCE and conservative double-column WTG experiments.
 
-Physics, diagnostics, and persistence live in separate modules. WTG fixes are
-intentionally separate from the SBM column repairs.
+Physics, WTG transport, diagnostics, and persistence live in separate modules.
 
 Original framework: Jonathan Lin (jonathanlin@cornell.edu).
 Original flux diagnostics: Pei-Tzu Wu.
@@ -10,7 +9,6 @@ from pathlib import Path
 import warnings
 
 import numpy as np
-from climlab import constants as const
 
 from dcm_physics import (
     ColumnConfig, create_column, create_land_column, create_sbm_convection,
@@ -25,7 +23,7 @@ from dcm_io import (
     build_daily_dataset, save_dataset, save_failure, mean_rce_dataset, plot_rce_temp_q,
     add_control_reference,
 )
-from dcm_wtg import find_tropopause, wtg_moisture_advection, advance_dcm_one_step
+from dcm_wtg import WTGConfig, advance_dcm_one_step
 
 
 def checked_physics_step(scm, failure_path):
@@ -90,26 +88,31 @@ def rcm(num_lev=60, n_days=1825, out_nc="data/rce_mean.nc", *, config=None,
 
 
 def integrate_dcm_daily(scm_land, scm_ocean, lev, ndays, land_MLD, ocean_MLD,
-                        lh_r, description, print_label="DCM"):
-    """Run legacy WTG with checked column physics and explicit transport accounting."""
+                        lh_r, description, print_label="DCM", *, wtg_config=None):
+    """Run mean-heating WTG with checked physics and transport accounting."""
     dt = timestep_seconds(scm_land)
     if not np.isclose(dt, timestep_seconds(scm_ocean)):
         raise ValueError("Column timesteps differ")
     steps = int(round(86400. / dt))
     if ndays < 1 or not np.isclose(steps * dt, 86400.):
         raise ValueError("Invalid duration or timestep")
-    p, above_850, tau_wtg = lev * 100., lev < 850., 2. * const.seconds_per_day
+    p = lev * 100.
+    wtg_config = wtg_config or WTGConfig()
     models = (scm_land, scm_ocean)
     records = []
     for day in range(ndays):
         acc = DailyAccumulator()
         for _ in range(steps):
+            before_physics = [snapshot(scm) for scm in models]
             current = [checked_physics_step(scm, f"data/{print_label}_{label}_failure.nc")
                        for label, scm in zip(("land", "ocean"), models)]
             before_wtg = [snapshot(scm) for scm in models]
             try:
-                omegas = advance_dcm_one_step(scm_land, scm_ocean, p, above_850,
-                                             tau_wtg, dt, advance_physics=False)
+                omegas = advance_dcm_one_step(
+                    scm_land, scm_ocean, p, dt,
+                    Tatm_before=tuple(state["Tatm"] for state in before_physics),
+                    config=wtg_config, advance_physics=False,
+                )
                 for scm in models:
                     check_state(scm)
             except Exception as error:
@@ -118,6 +121,14 @@ def integrate_dcm_daily(scm_land, scm_ocean, lev, ndays, land_MLD, ocean_MLD,
                 raise
             for scm, record, before, omega in zip(models, current, before_wtg, omegas):
                 include_wtg_diagnostics(scm, record, before, omega)
+            pair_wtg_energy = sum(record["energy_WTG"] for record in current)
+            pair_wtg_water = sum(record["water_WTG"] for record in current)
+            if abs(pair_wtg_energy) > 1.0e-7 or abs(pair_wtg_water) > 1.0e-13:
+                raise RuntimeError(
+                    "WTG pair conservation failed: "
+                    f"energy={pair_wtg_energy:.3e} W/m2, "
+                    f"water={pair_wtg_water:.3e} kg/m2/s"
+                )
             acc.add({key: np.stack([r[key] for r in current]) for key in current[0]})
         records.append(acc.mean())
         if day == 0 or (day + 1) % 100 == 0:
@@ -125,9 +136,10 @@ def integrate_dcm_daily(scm_land, scm_ocean, lev, ndays, land_MLD, ocean_MLD,
                   f"TOA={records[-1]['TOA_imbalance']}", flush=True)
     attrs = scm_land.column_config.attributes()
     attrs.update(description=description, land_MLD=float(land_MLD), ocean_MLD=float(ocean_MLD),
-                 lh_resistance=float(lh_r), wtg_timescale_days=2.,
-                 wtg_status="Legacy transport: known sign and energy-conservation defects",
+                 lh_resistance=float(lh_r),
+                 wtg_status="Conservative mean-heating and flux-form moisture transport",
                  co2_ppm=float(scm_land.subprocess["Radiation"].absorber_vmr["CO2"]) * 1e6)
+    attrs.update(wtg_config.attributes())
     ds = build_daily_dataset(records, lev, attrs, columns=["land", "ocean"])
     return ds.assign_coords(water_depth=("column", [land_MLD, ocean_MLD], {"units": "m"}))
 
