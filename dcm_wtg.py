@@ -111,12 +111,10 @@ def _omega_on_interfaces(omega_free, p, config):
 def _vertical_tracer_tendency(q, omega_edge, dp):
     """Conservative donor-cell vertical tracer transport in pressure space."""
     flux = np.zeros(q.size + 1)
-    for face in range(1, q.size):
-        if omega_edge[face] >= 0.0:  # downward: donor is the layer above
-            donor = q[face - 1]
-        else:  # upward: donor is the layer below
-            donor = q[face]
-        flux[face] = omega_edge[face] * donor
+    interior_omega = omega_edge[1:-1]
+    flux[1:-1] = interior_omega * np.where(
+        interior_omega >= 0.0, q[:-1], q[1:]
+    )
     return -(flux[1:] - flux[:-1]) / dp
 
 

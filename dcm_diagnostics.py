@@ -15,8 +15,8 @@ def timestep_seconds(scm):
     return float(dt / np.timedelta64(1, "s")) if isinstance(dt, np.timedelta64) else float(dt)
 
 
-def diag_scalar(scm, name):
-    return float(np.asarray(scm.diagnostics[name]).squeeze())
+def _scalar(value):
+    return float(np.asarray(value).squeeze())
 
 
 def snapshot(scm):
@@ -31,7 +31,7 @@ def check_state(scm):
     """Reject invalid states before the next radiation call; never clip."""
     for name in ("Tatm", "Ts", "q"):
         value = np.asarray(scm.state[name])
-        if not np.all(np.isfinite(value)):
+        if not np.isfinite(value).all():
             raise ValueError(f"Nonfinite {name} at model step {scm.time['steps']}")
     if np.any(scm.q < 0.) or np.any(scm.q >= 1.):
         raise ValueError("Specific humidity must satisfy 0 <= q < 1")
@@ -39,9 +39,10 @@ def check_state(scm):
         raise ValueError("Absolute temperature must be positive")
 
 
-def state_diagnostics(scm):
+def state_diagnostics(scm, mass=None):
     rh = np.asarray(scm.q / qsat(scm.Tatm, scm.lev))
-    mass = layer_mass(scm)
+    if mass is None:
+        mass = layer_mass(scm)
     return {
         "Tatm": np.asarray(scm.Tatm).copy(), "q": np.asarray(scm.q).copy(),
         "Ts": float(np.asarray(scm.Ts).squeeze()), "RH": rh.copy(),
@@ -61,10 +62,13 @@ def step_diagnostics(scm, before):
     dt = timestep_seconds(scm)
     mass = layer_mass(scm)
     cs = scm.Ts.domain.heat_capacity
-    result = state_diagnostics(scm)
-    result.update({key: diag_scalar(scm, key) for key in FLUX_NAMES})
+    result = state_diagnostics(scm, mass)
+    diagnostics = scm.diagnostics
+    result.update({key: _scalar(diagnostics[key]) for key in FLUX_NAMES})
     rad = scm.subprocess["Radiation"]
-    result["TOA_imbalance"] = diag_scalar(rad, "ASR") - diag_scalar(rad, "OLR")
+    rad_diagnostics = rad.diagnostics
+    result["TOA_imbalance"] = (_scalar(rad_diagnostics["ASR"])
+                               - _scalar(rad_diagnostics["OLR"]))
     result["surface_storage"] = float(np.sum(cs * (scm.Ts - before["Ts"])) / dt)
     result["thermal_storage"] = float(np.sum(mass * const.cp * (scm.Tatm - before["Tatm"])) / dt)
     result["latent_storage"] = float(np.sum(mass * const.Lhvap * (scm.q - before["q"])) / dt)
@@ -76,14 +80,17 @@ def step_diagnostics(scm, before):
         energy += np.sum(cs * tend.get("Ts", 0.))
         result[f"energy_{name}"] = float(energy)
     conv = scm.subprocess["Convection"]
-    result["cape"] = diag_scalar(conv, "cape")
-    result["cin"] = diag_scalar(conv, "cin")
+    conv_diagnostics = conv.diagnostics
+    result["cape"] = _scalar(conv_diagnostics["cape"])
+    result["cin"] = _scalar(conv_diagnostics["cin"])
     for name in ("Tatm", "q"):
         result[f"SBM_{name}_tendency"] = np.asarray(conv.tendencies[name]).copy()
-    result["precipitation_convective"] = diag_scalar(conv, "precipitation")
-    result["precipitation_large_scale"] = diag_scalar(scm.subprocess["Condensation"], "precipitation")
+    result["precipitation_convective"] = _scalar(conv_diagnostics["precipitation"])
+    result["precipitation_large_scale"] = _scalar(
+        scm.subprocess["Condensation"].diagnostics["precipitation"]
+    )
     result["precipitation"] = result["precipitation_convective"] + result["precipitation_large_scale"]
-    result["evaporation"] = diag_scalar(scm.subprocess["LHF"], "evaporation")
+    result["evaporation"] = _scalar(scm.subprocess["LHF"].diagnostics["evaporation"])
     result["energy_residual"] = result["energy_storage"] - result["TOA_imbalance"]
     result["budget_residual"] = result["energy_storage"] - sum(result[f"energy_{n}"] for n in scm.subprocess)
     result["water_residual"] = result["water_storage"] - result["evaporation"] + result["precipitation"]
@@ -101,7 +108,7 @@ def include_wtg_diagnostics(scm, record, before, omega):
     dthermal = float(np.sum(mass * const.cp * (scm.Tatm - before["Tatm"])) / dt)
     dwater = float(np.sum(mass * (scm.q - before["q"])) / dt)
     transport = dthermal + const.Lhvap * dwater
-    updated = state_diagnostics(scm)
+    updated = state_diagnostics(scm, mass)
     for name, value in updated.items():
         if name.endswith("_min"):
             record[name] = min(record[name], value)
@@ -204,4 +211,4 @@ def get_mean_control_state(ds_control, mean_days=365):
     if not 1 <= mean_days <= ds_control.sizes["time"]:
         raise ValueError("Invalid control averaging window")
     ds_mean = ds_control.isel(time=slice(-mean_days, None)).mean("time", keep_attrs=True)
-    return {k: ds_mean[k].values.copy() for k in ("Tatm", "q", "Ts")}, ds_mean
+    return {k: ds_mean[k].values.copy() for k in ("Tatm", "q", "Ts")}

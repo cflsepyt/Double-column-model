@@ -9,14 +9,16 @@ import xarray as xr
 from climlab import constants as const
 from climlab.utils.thermo import qsat
 
-from dcm_physics import create_column, create_land_column, ColumnConfig, apply_abrupt_4xco2
-from dcm_diagnostics import DailyAccumulator, check_state, layer_mass, snapshot, step_diagnostics
+from dcm_physics import ColumnConfig, apply_abrupt_4xco2, create_column
+from dcm_diagnostics import (
+    DailyAccumulator, check_state, equilibrium_summary, layer_mass, snapshot,
+    step_diagnostics,
+)
 from dcm_rundiag_0817 import (
     checked_physics_step, integrate_rce_daily, integrate_dcm_daily,
-    rcm, run_dcm_spinup, run_abrupt4xco2,
+    rcm, run_dcm_spinup, run_abrupt4xco2, run_parameter_sweep, MAX_WORKERS,
 )
 from dcm_io import save_dataset, mean_rce_dataset
-from dcm_diagnostics import equilibrium_summary
 from dcm_wtg import (
     WTGConfig, advance_dcm_one_step, common_static_stability, pressure_interfaces,
     transport_moisture_pair,
@@ -37,7 +39,10 @@ class SBMTests(unittest.TestCase):
         apply_abrupt_4xco2(model)
         for proc in (rad, *rad.subprocess.values()):
             self.assertAlmostEqual(proc.absorber_vmr["CO2"], 1200e-6)
-        land = create_land_column(60, model.Tatm.copy(), model.q.copy(), 1., 0.6)
+        land = create_column(
+            60, 1., lh_resistance=0.6,
+            Tatm_init=model.Tatm.copy(), qatm_init=model.q.copy(),
+        )
         self.assertEqual(land.subprocess["LHF"].resistance, 0.6)
         np.testing.assert_array_equal(land.q, model.q)
 
@@ -177,7 +182,7 @@ class SBMTests(unittest.TestCase):
             self.assertTrue(path.exists())
             self.assertTrue(path.with_name("rce_mean_daily.nc").exists())
             self.assertFalse(mean.attrs["equilibrated"])
-            control, state, _ = run_dcm_spinup(
+            control, state = run_dcm_spinup(
                 30, temperature, humidity, surface, lev, spinup_days=2,
                 restart_mean_days=2, ocean_MLD=20., lh_r=0.6,
             )
@@ -188,6 +193,19 @@ class SBMTests(unittest.TestCase):
             self.assertAlmostEqual(control.attrs["co2_ppm"], 300.)
             self.assertAlmostEqual(forced.attrs["co2_ppm"], 1200.)
             np.testing.assert_array_equal(forced.control_q, state["q"])
+
+    def test_parallel_worker_limit_and_empty_sweep(self):
+        model = create_column(10, 1.)
+        arguments = dict(
+            num_lev=10, Tatm_rce=model.Tatm.copy(), qatm_rce=model.q.copy(),
+            Ts_rce=float(np.asarray(model.Ts).squeeze()), lev=model.lev.copy(),
+            ocean_MLD_list=(), spinup_days=2, restart_mean_days=2, forced_days=1,
+        )
+        with self.assertRaises(ValueError):
+            run_parameter_sweep(**arguments, workers=MAX_WORKERS + 1)
+        with self.assertRaises(TypeError):
+            run_parameter_sweep(**arguments, workers=2.0)
+        self.assertEqual(run_parameter_sweep(**arguments, workers=MAX_WORKERS), [])
 
 
 if __name__ == "__main__":

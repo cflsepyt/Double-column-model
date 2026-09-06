@@ -10,13 +10,14 @@ from dcm_diagnostics import equilibrium_summary
 from dcm_io import save_dataset, save_json
 
 
-def run_single(dt, days, mean_days, num_lev, output_dir):
+def run_single(dt, days, mean_days, num_lev, output_dir, *, model=None):
     """Run one member independently; useful for concurrent long validations."""
     if not 2 <= mean_days <= days:
         raise ValueError("Require 2 <= mean_days <= days")
     output_dir = Path(output_dir)
     config = ColumnConfig(physics_dt=dt, radiation_dt=dt)
-    model = create_column(num_lev, water_depth=1., config=config)
+    if model is None:
+        model = create_column(num_lev, water_depth=1., config=config)
     label = f"dt{int(dt)}"
     print(f"Validating {label}, {days} days, {num_lev} levels", flush=True)
     ds = integrate_rce_daily(model, days, output_dir / f"{label}_failure.nc")
@@ -36,13 +37,15 @@ def validate(days=1825, mean_days=30, num_lev=60, output_dir="data/sbm_validatio
     for dt in (600., 300.):
         config = ColumnConfig(physics_dt=dt, radiation_dt=dt)
         model = create_column(num_lev, water_depth=1., config=config)
-        state = {k: np.asarray(v).copy() for k, v in model.state.items()}
+        state = {name: np.asarray(value).copy() for name, value in model.state.items()}
         if initial is None:
             initial = state
         else:
-            for key in initial:
-                np.testing.assert_array_equal(state[key], initial[key])
-        ds, summary = run_single(dt, days, mean_days, num_lev, output_dir)
+            for name in initial:
+                np.testing.assert_array_equal(state[name], initial[name])
+        ds, summary = run_single(
+            dt, days, mean_days, num_lev, output_dir, model=model,
+        )
         summaries[f"dt{int(dt)}"] = summary
         runs.append(ds)
     return compare_runs(runs, summaries, mean_days, output_dir)

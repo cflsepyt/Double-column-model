@@ -13,7 +13,7 @@ class ColumnConfig:
     physics_dt: float = 600.
     radiation_dt: float = 600.
     tau_bm: float = 7200.
-    rhbm: float = 0.8
+    rhbm: float = 0.7
     condensation_time: float = 14400.
     initial_rh: float = 0.65
     co2_ppm: float = 300.
@@ -112,12 +112,6 @@ def create_column(num_lev, water_depth, co2_forcing=False, *, config=None,
     model.column_config = config
     set_co2(model, config.co2_ppm * (4. if co2_forcing else 1.))
     return model
-
-
-def create_land_column(num_lev, Tatm_init, qatm_init, water_depth, lh_resistance,
-                       co2_forcing=False, *, config=None):
-    return create_column(num_lev, water_depth, co2_forcing, config=config,
-                         lh_resistance=lh_resistance, Tatm_init=Tatm_init, qatm_init=qatm_init)
 
 
 def create_dcm_pair(num_lev, Tatm_init, q_init, Ts_init, land_MLD, ocean_MLD, lh_r,

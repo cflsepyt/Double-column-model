@@ -2,22 +2,40 @@
 
 Physics, WTG transport, diagnostics, and persistence live in separate modules.
 
+Independent parameter-sweep members can run in separate processes.  The
+timestepping within each coupled land--ocean member remains serial and
+deterministic because every WTG update depends on the preceding model state.
+
 Original framework: Jonathan Lin (jonathanlin@cornell.edu).
 Original flux diagnostics: Pei-Tzu Wu.
 """
+import os
+
+# Each sweep worker is already one independent model process.  Prevent native
+# numerical libraries from creating nested thread pools that could exceed the
+# user-facing eight-core limit or make runtimes less predictable.
+for _thread_variable in (
+    "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+    "BLIS_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS",
+):
+    os.environ[_thread_variable] = "1"
+
+import argparse
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from itertools import product
+import multiprocessing
 from pathlib import Path
 import warnings
 
 import numpy as np
 
 from dcm_physics import (
-    ColumnConfig, create_column, create_land_column, create_sbm_convection,
-    create_dcm_pair, apply_abrupt_4xco2,
+    create_column, create_dcm_pair, apply_abrupt_4xco2,
 )
 from dcm_diagnostics import (
     DailyAccumulator, check_state, snapshot, step_diagnostics, timestep_seconds,
     equilibrium_summary, diagnose_control_equilibrium, get_mean_control_state,
-    diag_scalar, include_wtg_diagnostics,
+    include_wtg_diagnostics,
 )
 from dcm_io import (
     build_daily_dataset, save_dataset, save_failure, mean_rce_dataset, plot_rce_temp_q,
@@ -26,8 +44,11 @@ from dcm_io import (
 from dcm_wtg import WTGConfig, advance_dcm_one_step
 
 
-def checked_physics_step(scm, failure_path):
-    before = snapshot(scm)
+MAX_WORKERS = 8
+
+
+def checked_physics_step(scm, failure_path, before=None):
+    before = snapshot(scm) if before is None else before
     stage = "before physics"
     try:
         check_state(scm)
@@ -101,11 +122,17 @@ def integrate_dcm_daily(scm_land, scm_ocean, lev, ndays, land_MLD, ocean_MLD,
     models = (scm_land, scm_ocean)
     records = []
     for day in range(ndays):
-        acc = DailyAccumulator()
+        accumulators = (DailyAccumulator(), DailyAccumulator())
         for _ in range(steps):
             before_physics = [snapshot(scm) for scm in models]
-            current = [checked_physics_step(scm, f"data/{print_label}_{label}_failure.nc")
-                       for label, scm in zip(("land", "ocean"), models)]
+            current = [
+                checked_physics_step(
+                    scm, f"data/{print_label}_{label}_failure.nc", before
+                )
+                for label, scm, before in zip(
+                    ("land", "ocean"), models, before_physics
+                )
+            ]
             before_wtg = [snapshot(scm) for scm in models]
             try:
                 omegas = advance_dcm_one_step(
@@ -129,8 +156,13 @@ def integrate_dcm_daily(scm_land, scm_ocean, lev, ndays, land_MLD, ocean_MLD,
                     f"energy={pair_wtg_energy:.3e} W/m2, "
                     f"water={pair_wtg_water:.3e} kg/m2/s"
                 )
-            acc.add({key: np.stack([r[key] for r in current]) for key in current[0]})
-        records.append(acc.mean())
+            for accumulator, record in zip(accumulators, current):
+                accumulator.add(record)
+        column_means = [accumulator.mean() for accumulator in accumulators]
+        records.append({
+            key: np.stack([record[key] for record in column_means])
+            for key in column_means[0]
+        })
         if day == 0 or (day + 1) % 100 == 0:
             print(f"{print_label} day {day + 1}: Ts={records[-1]['Ts']}, "
                   f"TOA={records[-1]['TOA_imbalance']}", flush=True)
@@ -147,6 +179,7 @@ def integrate_dcm_daily(scm_land, scm_ocean, lev, ndays, land_MLD, ocean_MLD,
 def run_dcm_spinup(
     num_lev, Tatm_rce, qatm_rce, Ts_rce, lev, spinup_days=15000,
     restart_mean_days=365, land_MLD=1, ocean_MLD=100, lh_r=1,
+    case_label=None,
 ):
     """Run the 300 ppm DCM control and return its final-window mean state."""
     land, ocean = create_dcm_pair(
@@ -156,20 +189,21 @@ def run_dcm_spinup(
     ds = integrate_dcm_daily(
         land, ocean, lev, spinup_days, land_MLD, ocean_MLD, lh_r,
         description="Daily-mean coupled double-column control spin-up at 300 ppm CO2.",
-        print_label="CONTROL",
+        print_label="CONTROL" if case_label is None else f"CONTROL_{case_label}",
     )
     ds.attrs.update(
         experiment="DCM control spin-up", CO2="300 ppm", spinup_days=int(spinup_days),
         equilibrium_mean_days=int(restart_mean_days),
     )
     diagnose_control_equilibrium(ds, mean_days=restart_mean_days)
-    mean_state, ds_mean = get_mean_control_state(ds, mean_days=restart_mean_days)
-    return ds, mean_state, ds_mean
+    mean_state = get_mean_control_state(ds, mean_days=restart_mean_days)
+    return ds, mean_state
 
 
 def run_abrupt4xco2(
     num_lev, mean_state, lev, forced_days=15000, land_MLD=1,
     ocean_MLD=100, lh_r=1, restart_mean_days=365,
+    case_label=None,
 ):
     """Initialize from the mean control state and change CO2 to 1200 ppm."""
     land, ocean = create_dcm_pair(
@@ -182,7 +216,7 @@ def run_abrupt4xco2(
     ds = integrate_dcm_daily(
         land, ocean, lev, forced_days, land_MLD, ocean_MLD, lh_r,
         description="Daily-mean abrupt-4xCO2 DCM initialized from mean control state.",
-        print_label="4xCO2",
+        print_label="4xCO2" if case_label is None else f"4xCO2_{case_label}",
     )
     add_control_reference(ds, mean_state)
     ds.attrs.update(
@@ -194,7 +228,101 @@ def run_abrupt4xco2(
     return ds
 
 
-def main():
+def _case_label(land_mld, ocean_mld, resistance):
+    return f"r{resistance}_land{land_mld}_ocean{ocean_mld}"
+
+
+def run_sweep_case(
+    num_lev, Tatm_rce, qatm_rce, Ts_rce, lev, land_MLD, ocean_MLD, lh_r,
+    spinup_days, restart_mean_days, forced_days, output_dir="0817data",
+):
+    """Run and save one independent control/4xCO2 DCM experiment."""
+    label = _case_label(land_MLD, ocean_MLD, lh_r)
+    print(f"Starting {label} in process {os.getpid()}", flush=True)
+    ds_control, mean_state = run_dcm_spinup(
+        num_lev, Tatm_rce, qatm_rce, Ts_rce, lev,
+        spinup_days=spinup_days, restart_mean_days=restart_mean_days,
+        land_MLD=land_MLD, ocean_MLD=ocean_MLD, lh_r=lh_r,
+        case_label=label,
+    )
+    output_dir = Path(output_dir)
+    control_path = save_dataset(ds_control, output_dir / f"dcm_control_spinup_{label}.nc")
+    del ds_control
+    print(f"Saved control: {control_path}", flush=True)
+    print(f"Mean control Ts: land={mean_state['Ts'][0]:.3f}, "
+          f"ocean={mean_state['Ts'][1]:.3f} K", flush=True)
+    ds_forcing = run_abrupt4xco2(
+        num_lev, mean_state, lev, forced_days=forced_days,
+        land_MLD=land_MLD, ocean_MLD=ocean_MLD, lh_r=lh_r,
+        restart_mean_days=restart_mean_days, case_label=label,
+    )
+    forcing_path = save_dataset(ds_forcing, output_dir / f"dcm_abrupt4xco2_{label}.nc")
+    print(f"Saved forcing: {forcing_path}", flush=True)
+    return {
+        "label": label,
+        "control_path": str(control_path),
+        "forcing_path": str(forcing_path),
+        "mean_control_Ts_land": float(mean_state["Ts"][0]),
+        "mean_control_Ts_ocean": float(mean_state["Ts"][1]),
+    }
+
+
+def run_parameter_sweep(
+    num_lev, Tatm_rce, qatm_rce, Ts_rce, lev, *, land_MLD=1,
+    ocean_MLD_list=(100, 60, 20), lh_resistance_list=(0.6, 0.8, 1),
+    spinup_days=15000, restart_mean_days=365, forced_days=5000,
+    output_dir="0817data", workers=MAX_WORKERS,
+):
+    """Run independent DCM cases in at most eight single-threaded processes."""
+    if isinstance(workers, bool) or not isinstance(workers, (int, np.integer)):
+        raise TypeError("workers must be an integer")
+    if not 1 <= workers <= MAX_WORKERS:
+        raise ValueError(f"workers must be between 1 and {MAX_WORKERS}")
+    cases = list(product(ocean_MLD_list, lh_resistance_list))
+    if not cases:
+        return []
+
+    common = dict(
+        num_lev=num_lev, Tatm_rce=np.asarray(Tatm_rce),
+        qatm_rce=np.asarray(qatm_rce), Ts_rce=float(np.asarray(Ts_rce).squeeze()),
+        lev=np.asarray(lev), land_MLD=land_MLD,
+        spinup_days=spinup_days, restart_mean_days=restart_mean_days,
+        forced_days=forced_days, output_dir=str(output_dir),
+    )
+    if workers == 1:
+        return [run_sweep_case(**common, ocean_MLD=ocean_mld, lh_r=resistance)
+                for ocean_mld, resistance in cases]
+
+    worker_count = min(int(workers), len(cases), MAX_WORKERS)
+    print(f"Running {len(cases)} independent DCM cases with {worker_count} workers.",
+          flush=True)
+    results = [None] * len(cases)
+    # Spawn gives each worker an isolated copy of the compiled radiation and
+    # convection libraries.  Forking after an RCE run could inherit unsafe
+    # native-library state.
+    context = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=worker_count, mp_context=context) as executor:
+        futures = {
+            executor.submit(
+                run_sweep_case, **common, ocean_MLD=ocean_mld, lh_r=resistance,
+            ): index
+            for index, (ocean_mld, resistance) in enumerate(cases)
+        }
+        try:
+            for future in as_completed(futures):
+                index = futures[future]
+                results[index] = future.result()
+                print(f"Completed {results[index]['label']} "
+                      f"({sum(item is not None for item in results)}/{len(cases)}).",
+                      flush=True)
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            raise
+    return results
+
+
+def main(workers=MAX_WORKERS):
     num_lev, land_MLD = 60, 1
     ocean_MLD_list = [100, 60, 20]
     lh_resistance_list = [0.6, 0.8, 1]
@@ -205,26 +333,23 @@ def main():
     )
     print(ds_rce)
     plot_rce_temp_q(Tatm_rce, qatm_rce, lev)
-    for ocean_MLD in ocean_MLD_list:
-        for resistance in lh_resistance_list:
-            label = f"r{resistance}_land{land_MLD}_ocean{ocean_MLD}"
-            ds_control, mean_state, _ = run_dcm_spinup(
-                num_lev, Tatm_rce, qatm_rce, Ts_rce, lev,
-                spinup_days=spinup_days, restart_mean_days=restart_mean_days,
-                land_MLD=land_MLD, ocean_MLD=ocean_MLD, lh_r=resistance,
-            )
-            control_path = save_dataset(ds_control, f"0817data/dcm_control_spinup_{label}.nc")
-            print(f"Saved control: {control_path}")
-            print(f"Mean control Ts: land={mean_state['Ts'][0]:.3f}, "
-                  f"ocean={mean_state['Ts'][1]:.3f} K")
-            ds_forcing = run_abrupt4xco2(
-                num_lev, mean_state, lev, forced_days=forced_days,
-                land_MLD=land_MLD, ocean_MLD=ocean_MLD, lh_r=resistance,
-                restart_mean_days=restart_mean_days,
-            )
-            forcing_path = save_dataset(ds_forcing, f"0817data/dcm_abrupt4xco2_{label}.nc")
-            print(f"Saved forcing: {forcing_path}")
+    run_parameter_sweep(
+        num_lev, Tatm_rce, qatm_rce, Ts_rce, lev,
+        land_MLD=land_MLD, ocean_MLD_list=ocean_MLD_list,
+        lh_resistance_list=lh_resistance_list, spinup_days=spinup_days,
+        restart_mean_days=restart_mean_days, forced_days=forced_days,
+        workers=workers,
+    )
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--workers", type=int, default=MAX_WORKERS, choices=range(1, MAX_WORKERS + 1),
+        metavar="N", help="independent parameter-sweep processes (1-8; default: 8)",
+    )
+    return parser.parse_args(argv)
 
 
 if __name__ == "__main__":
-    main()
+    main(workers=parse_args().workers)

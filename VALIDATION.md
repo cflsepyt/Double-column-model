@@ -11,7 +11,7 @@ No environment installation or modification was needed.
 
 ## Regression checks
 
-All ten tests passed (`python -m unittest -v test_sbm`), covering:
+All eleven tests passed (`python -m unittest -v test_sbm`), covering:
 
 - Subsaturated initial conditions, shared radiation/humidity arrays, and CO2
   propagation to both radiation components, including quadrupling.
@@ -21,8 +21,35 @@ All ten tests passed (`python -m unittest -v test_sbm`), covering:
 - Synchronous and asynchronous radiation budget accounting.
 - DCM storage accounting with separate conservative WTG convergence.
 - Original RCE and control/abrupt-4xCO2 entry points.
+- Enforcement of the one-to-eight sweep-worker limit.
 
 Python compilation and `git diff --check` also passed.
+
+## Refactor verification
+
+The coupled integration now reuses the snapshot already taken for WTG, keeps a
+daily accumulator for each column, and stacks the column results once per day.
+Diagnostic mappings are read once per process and layer mass is reused within a
+diagnostic pass. The donor-cell face loop was replaced by its equivalent NumPy
+array expression. Exact dataset comparisons used during the performance audit
+showed identical values, coordinates, and attributes across all 60 output
+variables. The obsolete land-column wrapper and temporary thread benchmark were
+removed; callers use `create_column(..., lh_resistance=...)` directly.
+
+## Parallel parameter sweep
+
+The nine independent mixed-layer-depth/evaporation-resistance cases now use a
+spawned process pool with at most eight workers. Native OpenMP/BLAS thread
+counts are fixed at one per worker to prevent oversubscription. Each worker
+runs one control integration followed by its dependent abrupt-4xCO2
+integration; the coupled timestep and WTG calculations within a case are not
+reordered or parallelized.
+
+A short 20-level comparison initialized serial and process-pool runs from the
+same arrays, integrated two control days and one abrupt-4xCO2 day, and compared
+the complete saved control and forcing datasets with
+`xarray.testing.assert_identical`. Both datasets were identical. This verifies
+the execution-path change; it is not a climate-equilibration test.
 
 ## Single-column integrations
 

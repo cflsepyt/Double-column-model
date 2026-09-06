@@ -31,19 +31,34 @@ starts fresh; it does not resume an earlier validation run.
 | `dcm_rundiag_0817.py` | Integration and original control/abrupt-4xCO2 workflow |
 | `validate_sbm.py` | Standalone timestep-comparison command |
 
-The original `rcm()` return tuple and constructor names remain accessible through
-`dcm_rundiag_0817`. `rcm()` now saves both the requested mean file and a sibling
+The original `rcm()` return tuple remains available. `rcm()` saves both the
+requested mean file and a sibling
 `*_daily.nc` containing time-resolved diagnostics. The mean is an RCE candidate,
 with an explicit `equilibrated` attribute, rather than assumed equilibrium.
 The full experiment entry point requires the RCE checks to pass before continuing:
 
 ```bash
-python dcm_rundiag_0817.py
+python dcm_rundiag_0817.py --workers 8
 ```
 
 That command retains the original large parameter sweep and interactive profile
 plot. It is **not** the short verification command. Radiation now runs every
 physics step by default, so the full sweep is more expensive than before.
+
+The nine independent combinations of ocean mixed-layer depth and land
+evaporation resistance run concurrently, using eight worker processes by
+default. Each worker is restricted to one native numerical-library thread, so
+the calculation uses at most eight active compute cores and avoids nested
+OpenMP/BLAS oversubscription. Control and abrupt-4xCO2 integrations for a given
+combination remain sequential, and every timestep inside a coupled land--ocean
+model is unchanged. Use `--workers 1` for the original serial execution order.
+The initial standalone RCE must finish before the sweep and remains single-core.
+
+The integration loop reuses its pre-physics state snapshot, accumulates the two
+columns separately until the end of each day, and vectorizes the donor-cell
+vertical flux calculation. These changes reduce Python allocation and dispatch
+overhead without changing the physics cadence, arithmetic order within either
+column, WTG subcycling, or saved diagnostics.
 
 ## Column changes
 
@@ -55,7 +70,7 @@ physics step by default, so the full sweep is more expensive than before.
   control is 300 ppm and quadrupling produces 1200 ppm.
 - Radiation receives temperature state variables and the shared prognostic
   humidity array. Surface exchange uses `Cd`, not an unused `Ck` keyword.
-- SBM uses `tau_bm=7200`, `rhbm=0.8`, and the documented default branch options.
+- SBM uses `tau_bm=7200`, `rhbm=0.7`, and the documented branch options.
 - Large-scale condensation uses `RH_ref=1.0` and a 14400 s relaxation time.
   Finite-time relaxation can leave transient supersaturation. It does not
   prescribe RH in subsaturated layers or clip humidity.
